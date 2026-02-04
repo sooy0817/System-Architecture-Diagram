@@ -8,16 +8,21 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 # =========================================================
 # 1) VOCAB (사용자 제공 JSON 기반)
+#  - 요구사항:
+#    - Diagram 엔티티 포함(아래 ensure_diagram에서 강제)
+#    - 의왕 / 의왕센터 둘 다 허용(make_center에서 처리)
 # =========================================================
 VOCAB = {
     "ko": {
         "Corporation": ["은행", "중앙회"],
-        "Center": ["AWS", "의왕", "안성", "센터"],
+        # ⚠️ "센터" 단독은 학습 품질에 악영향 가능 -> 권장: 제거
+        # 요구사항에 없지만 전체 코드 정리 김에 안정성 개선
+        "Center": ["AWS", "의왕", "안성"],
         "NetworkZone": [
             "내부망",
             "내부SDN망",
@@ -70,7 +75,7 @@ VOCAB = {
     },
     "en": {
         "Corporation": ["Bank", "Head Office"],
-        "Center": ["AWS", "의왕센터", "안성센터"],
+        "Center": ["AWS", "Uiwang Center", "Anseong Center"],
         "NetworkZone": [
             "Internal",
             "Internal SDN",
@@ -112,13 +117,13 @@ VOCAB = {
     },
 }
 
+
 # =========================================================
 # 1.5) VARIANT / HINT POOLS (CandidateExtractor friendly)
+#  - 중복 정의 제거(원본에 2번 있었음)
 # =========================================================
-
-# candidate_extractor.py에서 쓰는 힌트 토큰을 "표면 단어"로 자주 노출시키기 위한 풀
 HINT_POOLS = {
-    # Zone type hints (zone_map / internal/external tokens)
+    # Zone type hints
     "zone_internal": ["내부망", "업무망", "내부", "사내", "internal"],
     "zone_external": ["대외망", "외부망", "외부", "external", "인터넷망", "Internet"],
     "zone_dmz": ["DMZ", "DMZ망", "Internet DMZ", "인터넷 DMZ", "인터넷망(DMZ)"],
@@ -131,19 +136,19 @@ HINT_POOLS = {
     ],
     "zone_user": ["사용자망", "유저망", "User Zone", "user zone"],
     "zone_branch": ["영업점망", "지점망", "Branch Network", "branch network"],
-    # Device type hints (device_type_map, L3/L4, IRT/ISW)
+    # Device type hints
     "layer3": ["L3", "l3", "Layer3", "layer3", "레이어3"],
     "layer4": ["L4", "l4", "Layer4", "layer4", "레이어4"],
     "router": ["라우터", "router", "RT", "rt"],
     "switch": ["스위치", "switch", "SW", "sw"],
     "irt": ["IRT", "irt", "IRT router", "irt-router", "IRT 라우터", "irt 라우터"],
     "isw": ["ISW", "isw", "ISW router", "isw-router", "ISW 라우터", "isw 라우터"],
-    # Engine hints (engine_map)
+    # Engine hints
     "oracle": ["ORACLE", "Oracle", "orcl", "ORCL"],
     "postgres": ["POSTGRES", "PostgreSQL", "postgres", "postgresql", "pg", "PG"],
     "mssql": ["MS_SQL", "MSSQL", "MS SQL", "sqlserver", "SQLSERVER", "SQL Server"],
     "tibero": ["TIBERO", "Tibero", "tibero"],
-    # Line context (re_line_context, isp_short_tokens)
+    # Line context
     "line_context": [
         "회선",
         "전용회선",
@@ -164,7 +169,6 @@ HINT_POOLS = {
     "isp_short": ["sk", "kt", "lg"],
 }
 
-# 문장에 삽입하는 "노이즈 태그" (괄호/하이픈/접두어)
 NOISE_DECORATORS = [
     lambda s: s,
     lambda s: f"({s})",
@@ -175,7 +179,6 @@ NOISE_DECORATORS = [
 
 
 def _maybe_space_variation(rng: random.Random, s: str) -> str:
-    # "SK브로드밴드" <-> "SK 브로드밴드" 같은 띄어쓰기 흔들기
     if rng.random() < 0.25:
         s = s.replace("브로드밴드", " 브로드밴드")
     if rng.random() < 0.12:
@@ -188,7 +191,6 @@ def _maybe_space_variation(rng: random.Random, s: str) -> str:
 
 
 def _case_variation(rng: random.Random, s: str) -> str:
-    # 영문 케이스 흔들기
     if any("a" <= c.lower() <= "z" for c in s):
         r = rng.random()
         if r < 0.20:
@@ -201,7 +203,6 @@ def _case_variation(rng: random.Random, s: str) -> str:
 
 
 def _decorate(rng: random.Random, s: str) -> str:
-    # 괄호/하이픈/대시 등
     if rng.random() < 0.22:
         s = rng.choice(NOISE_DECORATORS)(s)
     if rng.random() < 0.18:
@@ -215,151 +216,16 @@ def mention_variant(
     rng: random.Random, base: str, extra_hints: Optional[List[str]] = None
 ) -> str:
     """
-    base: 엔티티의 canonical 문자열(entities에 넣는 값)
-    extra_hints: candidate_extractor 힌트 토큰을 같이 노출하고 싶을 때
+    base: canonical 문자열(entities에 넣는 값)
+    extra_hints: candidate_extractor 힌트 토큰을 표면에 같이 노출하고 싶을 때
     """
     s = base
-
-    # base 자체 변형
     s = _maybe_space_variation(rng, s)
     s = _case_variation(rng, s)
 
-    # 힌트 토큰을 같이 노출
     if extra_hints and rng.random() < 0.70:
         hint = rng.choice(extra_hints)
         hint = _case_variation(rng, _maybe_space_variation(rng, hint))
-        # 여러 스타일: "base(hint)" / "hint base" / "base - hint"
-        style = rng.randrange(4)
-        if style == 0:
-            s = f"{s}({hint})"
-        elif style == 1:
-            s = f"{s} - {hint}"
-        elif style == 2:
-            s = f"{hint} {s}"
-        else:
-            s = f"{s} [{hint}]"
-
-    s = _decorate(rng, s)
-    return s
-
-
-# =========================================================
-# 1.5) VARIANT / HINT POOLS (CandidateExtractor friendly)
-# =========================================================
-
-# candidate_extractor.py에서 쓰는 힌트 토큰을 "표면 단어"로 자주 노출시키기 위한 풀
-HINT_POOLS = {
-    # Zone type hints (zone_map / internal/external tokens)
-    "zone_internal": ["내부망", "업무망", "내부", "사내", "internal"],
-    "zone_external": ["대외망", "외부망", "외부", "external", "인터넷망", "Internet"],
-    "zone_dmz": ["DMZ", "DMZ망", "Internet DMZ", "인터넷 DMZ", "인터넷망(DMZ)"],
-    "zone_internal_sdn": [
-        "내부SDN망",
-        "내부 SDN",
-        "SDN망",
-        "internal sdn",
-        "Internal SDN",
-    ],
-    "zone_user": ["사용자망", "유저망", "User Zone", "user zone"],
-    "zone_branch": ["영업점망", "지점망", "Branch Network", "branch network"],
-    # Device type hints (device_type_map, L3/L4, IRT/ISW)
-    "layer3": ["L3", "l3", "Layer3", "layer3", "레이어3"],
-    "layer4": ["L4", "l4", "Layer4", "layer4", "레이어4"],
-    "router": ["라우터", "router", "RT", "rt"],
-    "switch": ["스위치", "switch", "SW", "sw"],
-    "irt": ["IRT", "irt", "IRT router", "irt-router", "IRT 라우터", "irt 라우터"],
-    "isw": ["ISW", "isw", "ISW router", "isw-router", "ISW 라우터", "isw 라우터"],
-    # Engine hints (engine_map)
-    "oracle": ["ORACLE", "Oracle", "orcl", "ORCL"],
-    "postgres": ["POSTGRES", "PostgreSQL", "postgres", "postgresql", "pg", "PG"],
-    "mssql": ["MS_SQL", "MSSQL", "MS SQL", "sqlserver", "SQLSERVER", "SQL Server"],
-    "tibero": ["TIBERO", "Tibero", "tibero"],
-    # Line context (re_line_context, isp_short_tokens)
-    "line_context": [
-        "회선",
-        "전용회선",
-        "대외회선",
-        "망연계",
-        "MPLS",
-        "mpls",
-        "VPN",
-        "vpn",
-        "인터넷구간",
-        "ISP",
-        "isp",
-        "회선사",
-        "통신",
-        "라인",
-        "line",
-    ],
-    "isp_short": ["sk", "kt", "lg"],
-}
-
-# 문장에 삽입하는 "노이즈 태그" (괄호/하이픈/접두어)
-NOISE_DECORATORS = [
-    lambda s: s,
-    lambda s: f"({s})",
-    lambda s: f"[{s}]",
-    lambda s: f"-{s}-",
-    lambda s: f"{s}",
-]
-
-
-def _maybe_space_variation(rng: random.Random, s: str) -> str:
-    # "SK브로드밴드" <-> "SK 브로드밴드" 같은 띄어쓰기 흔들기
-    if rng.random() < 0.25:
-        s = s.replace("브로드밴드", " 브로드밴드")
-    if rng.random() < 0.12:
-        s = s.replace("데이콤", " 데이콤")
-    if rng.random() < 0.10:
-        s = s.replace("_", rng.choice(["_", "-", " "]))
-    if rng.random() < 0.10:
-        s = s.replace("-", rng.choice(["-", "_", ""]))
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def _case_variation(rng: random.Random, s: str) -> str:
-    # 영문 케이스 흔들기
-    if any("a" <= c.lower() <= "z" for c in s):
-        r = rng.random()
-        if r < 0.20:
-            return s.lower()
-        if r < 0.40:
-            return s.upper()
-        if r < 0.55:
-            return s.title()
-    return s
-
-
-def _decorate(rng: random.Random, s: str) -> str:
-    # 괄호/하이픈/대시 등
-    if rng.random() < 0.22:
-        s = rng.choice(NOISE_DECORATORS)(s)
-    if rng.random() < 0.18:
-        s = s.replace("(", rng.choice(["(", " ("])).replace(
-            ")", rng.choice([")", ") "])
-        )
-    return s
-
-
-def mention_variant(
-    rng: random.Random, base: str, extra_hints: Optional[List[str]] = None
-) -> str:
-    """
-    base: 엔티티의 canonical 문자열(entities에 넣는 값)
-    extra_hints: candidate_extractor 힌트 토큰을 같이 노출하고 싶을 때
-    """
-    s = base
-
-    # base 자체 변형
-    s = _maybe_space_variation(rng, s)
-    s = _case_variation(rng, s)
-
-    # 힌트 토큰을 같이 노출
-    if extra_hints and rng.random() < 0.70:
-        hint = rng.choice(extra_hints)
-        hint = _case_variation(rng, _maybe_space_variation(rng, hint))
-        # 여러 스타일: "base(hint)" / "hint base" / "base - hint"
         style = rng.randrange(4)
         if style == 0:
             s = f"{s}({hint})"
@@ -603,15 +469,27 @@ def entity_pack(**kwargs: List[str]) -> Dict[str, List[str]]:
     return out
 
 
-def rel(head: str, tail: str, type_: str) -> Dict[str, str]:
-    return {"head": head, "tail": tail, "type": type_}
+# =========================================================
+# ✅ GLiNER2 Relations format helpers
+# relations item: {"REL_TYPE": {"head": "...", "tail": "..."}}
+# =========================================================
+def rel(head: str, tail: str, type_: str) -> Dict[str, Dict[str, str]]:
+    return {type_: {"head": head, "tail": tail}}
 
 
-def dedupe_relations(relations: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def rel_parts(r: Dict[str, Dict[str, str]]) -> Tuple[str, str, str]:
+    ((t, payload),) = r.items()
+    return t, payload["head"], payload["tail"]
+
+
+def dedupe_relations(
+    relations: List[Dict[str, Dict[str, str]]],
+) -> List[Dict[str, Dict[str, str]]]:
     out = []
     seen = set()
     for r in relations:
-        key = (r["head"], r["type"], r["tail"])
+        t, h, ta = rel_parts(r)
+        key = (h, t, ta)
         if key not in seen:
             out.append(r)
             seen.add(key)
@@ -626,6 +504,7 @@ def vocab_pick(rng: random.Random, lang: str, label: str) -> str:
 
 
 def make_center(rng: random.Random, lang: str) -> str:
+    # 요구: 의왕/의왕센터 둘 다 가능
     if lang == "ko":
         base = rng.choice(["AWS", "의왕", "안성"])
         return base + "센터" if rng.random() < 0.78 else base
@@ -681,38 +560,40 @@ def label_of(entities: Dict[str, List[str]], name: str) -> Optional[str]:
 
 
 def schema_violation(
-    entities: Dict[str, List[str]], relations: List[Dict[str, str]]
+    entities: Dict[str, List[str]],
+    relations: List[Dict[str, Dict[str, str]]],
 ) -> Optional[str]:
     for r in relations:
-        h = label_of(entities, r["head"])
-        t = label_of(entities, r["tail"])
-        if h is None or t is None:
+        t, h, ta = rel_parts(r)
+        hl = label_of(entities, h)
+        tl = label_of(entities, ta)
+        if hl is None or tl is None:
             return f"unknown_entity_in_relation:{r}"
-        if (h, r["type"], t) not in ALLOWED_TRIPLES:
-            return f"disallowed_triple:({h},{r['type']},{t})"
+        if (hl, t, tl) not in ALLOWED_TRIPLES:
+            return f"disallowed_triple:({hl},{t},{tl})"
     return None
 
 
 def normalize_relation_directions(
-    entities: Dict[str, List[str]], relations: List[Dict[str, str]]
-) -> List[Dict[str, str]]:
+    entities: Dict[str, List[str]],
+    relations: List[Dict[str, Dict[str, str]]],
+) -> List[Dict[str, Dict[str, str]]]:
     """
-    생성된 관계를 스키마 기준으로 최종 보정.
+    생성된 CONNECTED_TO 관계 방향을 스키마 기준으로 최종 보정.
     핵심: (ExternalSystem CONNECTED_TO Server) => (Server CONNECTED_TO ExternalSystem)
     """
-    out: List[Dict[str, str]] = []
+    out: List[Dict[str, Dict[str, str]]] = []
     for r in relations:
-        if r["type"] != "CONNECTED_TO":
+        t, h, ta = rel_parts(r)
+        if t != "CONNECTED_TO":
             out.append(r)
             continue
 
-        h = r["head"]
-        t = r["tail"]
         hl = label_of(entities, h)
-        tl = label_of(entities, t)
+        tl = label_of(entities, ta)
 
         if hl == "ExternalSystem" and tl == "Server":
-            out.append(rel(t, h, "CONNECTED_TO"))
+            out.append(rel(ta, h, "CONNECTED_TO"))
             continue
 
         out.append(r)
@@ -727,17 +608,33 @@ def normalize_relation_directions(
 class Scenario:
     text: str
     entities: Dict[str, List[str]]
-    relations: List[Dict[str, str]]
+    relations: List[Dict[str, Dict[str, str]]]
     meta: Dict[str, str]
 
 
+def ensure_diagram(rng: random.Random, sc: Scenario, lang: str) -> Scenario:
+    """
+    ✅ 요구사항: Diagram 엔티티는 반드시 포함해야 함.
+    + Corporation이 존재하면 HAS_COVERS를 높은 확률로 보강(데이터 다양성/일관성).
+    """
+    if "Diagram" not in sc.entities or not sc.entities["Diagram"]:
+        diagram = rng.choice(
+            ["인증서 시스템 구성도", "결제 시스템 구성도", "계정계 구성도"]
+        )
+        sc.entities["Diagram"] = [diagram]
+    else:
+        diagram = sc.entities["Diagram"][0]
+
+    corp_list = sc.entities.get("Corporation", [])
+    if corp_list and rng.random() < 0.75:
+        corp = corp_list[0]
+        sc.relations.append(rel(diagram, corp, "HAS_COVERS"))
+
+    sc.relations = dedupe_relations(sc.relations)
+    return sc
+
+
 def scenario_core_hierarchy(rng: random.Random, lang: str) -> Scenario:
-    """
-    기존 core의 '333 세트 반복'을 깨기 위해:
-    - HAS_COVERS / HAS_CENTER / HAS_ZONE 중 일부를 확률적으로 누락
-    - IN_ZONE 대상: Server 고정이 아니라 Server/Interface/SystemGroup 중 랜덤
-    - DB 연결: Server->DBMS 고정이 아니라 Interface->DBMS로 대체되는 케이스 일부 추가
-    """
     diagram = rng.choice(
         ["인증서 시스템 구성도", "결제 시스템 구성도", "계정계 구성도"]
     )
@@ -753,9 +650,9 @@ def scenario_core_hierarchy(rng: random.Random, lang: str) -> Scenario:
     engine = vocab_pick(rng, lang, "DBMS")
     db_mention = paren_variant(rng, dbms, engine) if rng.random() < 0.65 else dbms
 
-    # ---- 문장 구성 (부분 누락)
     sents: List[str] = []
-    relations: List[Dict[str, str]] = []
+    relations: List[Dict[str, Dict[str, str]]] = []
+
     entities = entity_pack(
         Diagram=[diagram],
         Corporation=[corp],
@@ -767,22 +664,18 @@ def scenario_core_hierarchy(rng: random.Random, lang: str) -> Scenario:
         DBMS=[dbms],
     )
 
-    # HAS_COVERS (80% 유지)
     if rng.random() < 0.80:
         sents.append(pick_template(rng, "HAS_COVERS", corp=corp))
         relations.append(rel(diagram, corp, "HAS_COVERS"))
 
-    # HAS_CENTER (80% 유지)
     if rng.random() < 0.80:
         sents.append(pick_template(rng, "HAS_CENTER", corp=corp, center=center))
         relations.append(rel(corp, center, "HAS_CENTER"))
 
-    # HAS_ZONE (90% 유지)
     if rng.random() < 0.90:
         sents.append(pick_template(rng, "HAS_ZONE", center=center, zone=zone))
         relations.append(rel(center, zone, "HAS_ZONE"))
 
-    # IN_ZONE 대상 랜덤화 (Server/Interface/SystemGroup)
     zone_target_kind = rng.choices(
         ["Server", "Interface", "SystemGroup"], weights=[0.55, 0.25, 0.20], k=1
     )[0]
@@ -791,10 +684,10 @@ def scenario_core_hierarchy(rng: random.Random, lang: str) -> Scenario:
         if zone_target_kind == "Server"
         else (iface if zone_target_kind == "Interface" else sysg)
     )
+
     sents.append(pick_template(rng, "IN_ZONE", node=zone_target, zone=zone))
     relations.append(rel(zone_target, zone, "IN_ZONE"))
 
-    # DB 연결: 기본은 Server->DBMS, 일부는 Interface->DBMS로 대체
     if rng.random() < 0.15:
         sents.append(pick_template(rng, "IFACE_DB", iface=iface, dbms=db_mention))
         relations.append(rel(iface, dbms, "CONNECTED_TO"))
@@ -802,11 +695,10 @@ def scenario_core_hierarchy(rng: random.Random, lang: str) -> Scenario:
         sents.append(pick_template(rng, "SERVER_DB", server=server, dbms=db_mention))
         relations.append(rel(server, dbms, "CONNECTED_TO"))
 
-    # 일부 케이스에서 IN_GROUP 추가 (구조 다양화)
     if rng.random() < 0.35:
         sents.append(pick_template(rng, "IN_GROUP", node=server, group=sysg))
         relations.append(rel(server, sysg, "IN_GROUP"))
-        if rng.random() < 0.6:
+        if rng.random() < 0.60:
             sents.append(pick_template(rng, "IN_GROUP", node=iface, group=sysg))
             relations.append(rel(iface, sysg, "IN_GROUP"))
 
@@ -828,7 +720,7 @@ def scenario_group_membership(rng: random.Random, lang: str) -> Scenario:
 
     server = make_server_name(rng, lang)
     iface = vocab_pick(rng, lang, "Interface")
-    ext = vocab_pick(rng, lang, "ExternalSystem") if rng.random() < 0.6 else None
+    ext = vocab_pick(rng, lang, "ExternalSystem") if rng.random() < 0.60 else None
 
     s1 = pick_template(rng, "HAS_ZONE", center=center, zone=zone)
     s2 = pick_template(rng, "IN_ZONE", node=group, zone=zone)
@@ -843,7 +735,7 @@ def scenario_group_membership(rng: random.Random, lang: str) -> Scenario:
         Server=[server],
         Interface=[iface],
     )
-    relations = [
+    relations: List[Dict[str, Dict[str, str]]] = [
         rel(center, zone, "HAS_ZONE"),
         rel(group, zone, "IN_ZONE"),
         rel(server, group, "IN_GROUP"),
@@ -901,7 +793,7 @@ def scenario_external_connections(rng: random.Random, lang: str) -> Scenario:
         if target != iface:
             entities["Interface"] = [iface, target]
 
-    relations = [
+    relations: List[Dict[str, Dict[str, str]]] = [
         rel(center, device, "HAS_DEVICE"),
         rel(ext, iface, "CONNECTED_TO"),
         rel(iface, zone, "IN_ZONE"),
@@ -930,23 +822,18 @@ def scenario_db_replication(rng: random.Random, lang: str) -> Scenario:
     eng_a = vocab_pick(rng, lang, "DBMS")
     eng_b = vocab_pick(rng, lang, "DBMS")
 
-    a_m = paren_variant(rng, db_a, eng_a) if rng.random() < 0.7 else db_a
-    b_m = paren_variant(rng, db_b, eng_b) if rng.random() < 0.7 else db_b
+    a_m = paren_variant(rng, db_a, eng_a) if rng.random() < 0.70 else db_a
+    b_m = paren_variant(rng, db_b, eng_b) if rng.random() < 0.70 else db_b
 
     s1 = pick_template(rng, "DB_REPLICATION", a=a_m, b=b_m)
     text = _join_sentences(rng, [s1])
 
     entities = entity_pack(DBMS=[db_a, db_b])
-    relations = [rel(db_a, db_b, "CONNECTED_TO")]
+    relations: List[Dict[str, Dict[str, str]]] = [rel(db_a, db_b, "CONNECTED_TO")]
     return Scenario(text, entities, relations, meta={"scenario": "db_replication"})
 
 
 def scenario_zone_multilist(rng: random.Random, lang: str) -> Scenario:
-    """
-    다중 나열 IN_ZONE 강화 + 문장 다양화:
-    - 한 존에 Server/Interface/ExternalSystem이 동시에 등장
-    - IN_ZONE 관계 3개 이상 생성 (분포 안정)
-    """
     zone = vocab_pick(rng, lang, "NetworkZone")
     center = make_center(rng, lang)
 
@@ -954,7 +841,6 @@ def scenario_zone_multilist(rng: random.Random, lang: str) -> Scenario:
     b_iface = vocab_pick(rng, lang, "Interface")
     c_ext = vocab_pick(rng, lang, "ExternalSystem")
 
-    # 문장
     s0 = (
         pick_template(rng, "HAS_ZONE", center=center, zone=zone)
         if rng.random() < 0.75
@@ -974,7 +860,8 @@ def scenario_zone_multilist(rng: random.Random, lang: str) -> Scenario:
         Interface=[b_iface],
         ExternalSystem=[c_ext],
     )
-    relations = [
+
+    relations: List[Optional[Dict[str, Dict[str, str]]]] = [
         rel(center, zone, "HAS_ZONE") if s0 else None,
         rel(a_server, zone, "IN_ZONE"),
         rel(b_iface, zone, "IN_ZONE"),
@@ -987,11 +874,6 @@ def scenario_zone_multilist(rng: random.Random, lang: str) -> Scenario:
 
 
 def scenario_connection_chain(rng: random.Random, lang: str) -> Scenario:
-    """
-    체인 연결(연결 경로) 강화:
-    Server -> Interface -> Device -> ExternalSystem
-    + 일부는 Interface IN_ZONE 또는 Device 연결 문장도 섞음
-    """
     a = make_server_name(rng, lang)
     iface = vocab_pick(rng, lang, "Interface")
     ext = vocab_pick(rng, lang, "ExternalSystem")
@@ -1026,7 +908,7 @@ def scenario_connection_chain(rng: random.Random, lang: str) -> Scenario:
         **{device_label: [device]},
     )
 
-    relations = [
+    relations: List[Dict[str, Dict[str, str]]] = [
         rel(a, iface, "CONNECTED_TO"),
         rel(iface, device, "CONNECTED_TO"),
         rel(device, ext, "CONNECTED_TO"),
@@ -1059,7 +941,7 @@ def min_relations_required(scenario_name: str, baseline: int) -> int:
         "external_connections": max(3, baseline),
         "zone_multilist": max(3, baseline),
         "connection_chain": max(3, baseline),
-        "db_replication": 1,  # 구조상 1개 고정
+        "db_replication": 1,
     }
     return per.get(scenario_name, baseline)
 
@@ -1068,6 +950,10 @@ def generate_one(rng: random.Random, lang: str, weights: List[float]) -> Scenari
     fn = rng.choices(SCENARIOS, weights=weights, k=1)[0]
     sc = fn(rng, lang)
     sc.relations = dedupe_relations(sc.relations)
+
+    # ✅ Diagram 강제 포함(+ HAS_COVERS 보강)
+    sc = ensure_diagram(rng, sc, lang)
+
     return sc
 
 
@@ -1198,10 +1084,11 @@ def main():
                 entity_counts[lab] += len(names)
 
             for r in sc.relations:
-                rel_counts[r["type"]] += 1
-                h_lab = label_of(sc.entities, r["head"])
-                t_lab = label_of(sc.entities, r["tail"])
-                triple_counts[(h_lab, r["type"], t_lab)] += 1
+                t, h, ta = rel_parts(r)
+                rel_counts[t] += 1
+                h_lab = label_of(sc.entities, h)
+                t_lab = label_of(sc.entities, ta)
+                triple_counts[(h_lab, t, t_lab)] += 1
 
     if args.verbose:
         print(f"WROTE: {written}")
