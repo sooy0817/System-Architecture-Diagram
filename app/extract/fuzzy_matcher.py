@@ -72,7 +72,8 @@ class FuzzyEntityMatcher:
 
     # Confidence 임계값
     CONFIDENCE_AUTO = 0.85  # 이상이면 자동 승인
-    CONFIDENCE_ASK = 0.60  # 이상이면 확인 요청
+    CONFIDENCE_ASK = 0.65  # 이상이면 확인 요청
+    # 0.65 미만이면 경고만 하고 진행
 
     def __init__(self):
         self.use_rapidfuzz = RAPIDFUZZ_AVAILABLE
@@ -133,14 +134,30 @@ class FuzzyEntityMatcher:
         return None
 
     def extract_corporations(self, text: str) -> List[MatchResult]:
-        """법인 추출"""
+        """법인 추출 (Fuzzy Matching 적용)"""
         results = []
 
+        # 1. 정확한 매칭 먼저 시도
         for candidate in self.CORPORATION_CANDIDATES:
             if candidate in text:
-                match = self.match_text(candidate, [candidate])
-                if match:
-                    results.append(match)
+                results.append(
+                    MatchResult(
+                        matched=candidate,
+                        original=candidate,
+                        confidence=1.0,
+                        match_type="exact",
+                    )
+                )
+
+        # 2. 정확한 매칭이 없으면 Fuzzy 매칭 시도
+        if not results and self.use_rapidfuzz:
+            # 텍스트를 단어로 분리
+            words = text.split()
+            for word in words:
+                if len(word) >= 2:  # 최소 2글자 이상
+                    match = self.match_text(word, self.CORPORATION_CANDIDATES)
+                    if match:
+                        results.append(match)
 
         # 중복 제거
         seen = set()
@@ -149,6 +166,8 @@ class FuzzyEntityMatcher:
             if r.matched not in seen:
                 seen.add(r.matched)
                 unique_results.append(r)
+
+        return unique_results
 
         return unique_results
 
@@ -181,17 +200,26 @@ class FuzzyEntityMatcher:
             for m in re.finditer(pat, text):
                 name = m.group(1)
                 if name and name != "센터" and len(name) >= 2:
-                    # Fuzzy 매칭 시도
-                    match = self.match_text(name, self.CENTER_CANDIDATES)
+                    # 이미 정확 매칭된 것은 스킵
+                    if any(
+                        r.matched == name and r.match_type == "exact" for r in results
+                    ):
+                        continue
+
+                    # Fuzzy 매칭 시도 (threshold를 낮춰서 적극적으로 매칭)
+                    match = self.match_text(
+                        name, self.CENTER_CANDIDATES, threshold=0.50
+                    )
                     if match:
+                        # Fuzzy 매칭 성공 → 매칭된 후보 사용
                         results.append(match)
                     else:
-                        # 후보에 없으면 그대로 추가 (낮은 confidence)
+                        # Fuzzy 매칭 실패 → 원본 그대로 사용 (낮은 confidence)
                         results.append(
                             MatchResult(
                                 matched=name,
                                 original=name,
-                                confidence=0.7,
+                                confidence=0.60,  # 0.65 미만 → 경고만 하고 진행
                                 match_type="pattern",
                             )
                         )
@@ -199,7 +227,11 @@ class FuzzyEntityMatcher:
         # 3. 대문자 영어 (AWS, IDC 등)
         english_caps = re.findall(r"\b[A-Z]{2,}\b", text)
         for cap in english_caps:
-            match = self.match_text(cap, self.CENTER_CANDIDATES)
+            # 이미 정확 매칭된 것은 스킵
+            if any(r.matched == cap and r.match_type == "exact" for r in results):
+                continue
+
+            match = self.match_text(cap, self.CENTER_CANDIDATES, threshold=0.50)
             if match:
                 results.append(match)
             else:
@@ -208,6 +240,24 @@ class FuzzyEntityMatcher:
                         matched=cap, original=cap, confidence=0.8, match_type="pattern"
                     )
                 )
+
+        # 4. 단어 단위 Fuzzy 매칭 (패턴 없이 입력된 센터명 처리)
+        # "법인: 은행, AWS, 으왕" 같은 경우 "으왕"을 잡기 위함
+        words = re.findall(r"[가-힣A-Za-z0-9]+", text)
+        for word in words:
+            if len(word) >= 2:
+                # 이미 추출된 것은 스킵
+                if any(r.matched == word or r.original == word for r in results):
+                    continue
+
+                # 법인 키워드는 스킵
+                if word in self.CORPORATION_CANDIDATES:
+                    continue
+
+                # Fuzzy 매칭 시도
+                match = self.match_text(word, self.CENTER_CANDIDATES, threshold=0.50)
+                if match:
+                    results.append(match)
 
         # 중복 제거
         seen = set()
@@ -224,8 +274,9 @@ class FuzzyEntityMatcher:
         텍스트에서 법인/센터 추출 + Confidence 기반 확인 필요 여부 판단
 
         로직:
-        - 두 개 이상 애매함 → 전체 재입력 요청
-        - 하나만 애매함 → 그것만 확인 요청
+        - 두 개 이상 애매함 (0.65~0.85) → 전체 재입력 요청
+        - 하나만 애매함 (0.65~0.85) → 그것만 확인 요청
+        - 낮은 confidence (0.65 미만) → 경고만 하고 진행
         - 법인도 오타면 확인 요청 (기본법인 X)
 
         Returns:
@@ -234,7 +285,7 @@ class FuzzyEntityMatcher:
         corporations = self.extract_corporations(text)
         centers = self.extract_centers(text)
 
-        # 애매한 항목들 찾기
+        # 애매한 항목들 찾기 (0.65~0.85)
         uncertain_corps = [
             c
             for c in corporations
@@ -246,7 +297,12 @@ class FuzzyEntityMatcher:
             if self.CONFIDENCE_ASK <= c.confidence < self.CONFIDENCE_AUTO
         ]
 
+        # 낮은 confidence 항목들 찾기 (0.65 미만)
+        low_conf_corps = [c for c in corporations if c.confidence < self.CONFIDENCE_ASK]
+        low_conf_centers = [c for c in centers if c.confidence < self.CONFIDENCE_ASK]
+
         total_uncertain = len(uncertain_corps) + len(uncertain_centers)
+        has_low_confidence = len(low_conf_corps) + len(low_conf_centers) > 0
 
         # 케이스 1: 두 개 이상 애매함 → 전체 재입력 요청
         if total_uncertain >= 2:
@@ -266,8 +322,9 @@ class FuzzyEntityMatcher:
                 entity = uncertain_centers[0]
                 entity_type = "센터"
 
+            # 사용자 입력(original)이 아니라 매칭된 후보(matched)를 보여줘야 함
             confirmation_message = (
-                f"혹시 '{entity_type}: {entity.matched}' 를 의미하신 걸까요?\n"
+                f"혹시 '{entity.matched}' {entity_type}를 의미하신 걸까요?\n"
                 f"맞다면 '확인' 또는 '네'를 입력해 주세요.\n"
                 f"아니면 다시 입력해 주세요."
             )
@@ -279,7 +336,16 @@ class FuzzyEntityMatcher:
                 confirmation_message=confirmation_message,
             )
 
-        # 케이스 3: 모두 확실함 → 바로 진행
+        # 케이스 3: 낮은 confidence → 경고만 하고 진행
+        if has_low_confidence:
+            return EntityMatchResult(
+                corporations=corporations,
+                centers=centers,
+                needs_confirmation=False,
+                confirmation_message="low_confidence_warning",  # 특수 플래그
+            )
+
+        # 케이스 4: 모두 확실함 → 바로 진행
         return EntityMatchResult(
             corporations=corporations,
             centers=centers,
@@ -288,14 +354,16 @@ class FuzzyEntityMatcher:
         )
 
     def get_best_matches(
-        self, results: List[MatchResult], min_confidence: float = 0.60
+        self, results: List[MatchResult], min_confidence: float = 0.50
     ) -> List[str]:
         """
         신뢰도 기준 이상인 매칭 결과만 반환
 
+        낮은 confidence(0.65 미만)도 포함시켜서 경고 메시지와 함께 진행
+
         Args:
             results: 매칭 결과 리스트
-            min_confidence: 최소 신뢰도
+            min_confidence: 최소 신뢰도 (기본 0.50)
 
         Returns:
             매칭된 엔티티 이름 리스트

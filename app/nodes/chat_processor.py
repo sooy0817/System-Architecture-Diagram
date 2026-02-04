@@ -661,6 +661,11 @@ def _step_corp_center(state: GraphState, message: str, extractor) -> Dict[str, A
 
         return {"response": response, "next_step": "corp-center", "ui_data": ui}
 
+    # 케이스: 낮은 confidence (0.65 미만) → 경고만 하고 진행
+    has_low_confidence_warning = (
+        match_result.confirmation_message == "low_confidence_warning"
+    )
+
     # 법인이 없으면 재입력 요청 (기본법인 사용 안 함)
     if not corporations:
         ui = _ui_payload(
@@ -747,6 +752,10 @@ def _step_corp_center(state: GraphState, message: str, extractor) -> Dict[str, A
     # 확인 메시지 생성
     centers_display = ", ".join([f"`{c}`" for c in centers])
     confirmation = f"✅ `{corporation}` 구성도를 만들어드리겠습니다!\n\n📋 총 {len(centers)}개 센터: {centers_display}\n\n먼저 `{current_center}`부터 시작하겠습니다."
+
+    # 낮은 confidence 경고 추가
+    if has_low_confidence_warning:
+        confirmation += "\n\n⚠️ 일부 입력에 오탈자가 있을 수 있습니다. 잘못 인식된 경우 '다시'를 입력해 주세요."
 
     response = _bubble(
         question=f"{confirmation}\n\n어떤 네트워크 영역들이 있나요?",
