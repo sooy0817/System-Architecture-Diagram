@@ -26,6 +26,10 @@ class CandidateExtractor:
             self.corporation_allow, allow_suffix=None, case_insensitive=True
         )
 
+        self.center_patterns = self._build_ko_ascii_token_patterns(
+            self.center_allow, allow_suffix=None, case_insensitive=True
+        )
+
         self.engine_map = {
             "postgres": ["pg"],
             "oracle": ["orcl"],
@@ -161,11 +165,17 @@ class CandidateExtractor:
 
     def _token_boundary_wrap(self, token: str, *, allow_suffix: str | None) -> str:
         """
-        한글/영문/숫자 토큰 경계를 강제로 잡는다.
-        예) '의왕'이 '의왕센터', '의왕 내부망'에서 토큰으로 잘 잡히게.
+        한글/영문 토큰 경계를 잡는다.
+        - 한글 토큰(의왕/안성/은행 등): 뒤에 조사/접미어(센터/으로/에서 등) 붙는 걸 허용
+        - 대신 영문/숫자/_ 가 바로 붙는 이상 결합은 차단
         """
         left = r"(?<![0-9A-Za-z_가-힣])"
-        right = r"(?![0-9A-Za-z_가-힣])"
+
+        # token이 '순수 한글'이면 right 완화(조사 완화)
+        if re.fullmatch(r"[가-힣]+", token):
+            right = r"(?![0-9A-Za-z_])"
+        else:
+            right = r"(?![0-9A-Za-z_가-힣])"
 
         core = re.escape(token)
         if allow_suffix:
@@ -351,6 +361,20 @@ class CandidateExtractor:
                 )
 
         lowered = text.lower()
+
+        # A-2) CenterHint
+        for canon, pat in self.center_patterns:
+            for m in pat.finditer(text):
+                s, e = m.span()
+                out.append(
+                    Candidate(
+                        text=text[s:e],
+                        type="CenterHint",
+                        span=(s, e),
+                        context=self._context(text, s, e),
+                        normalized=canon,
+                    )
+                )
 
         # B) EngineHint - 정규화/유연매칭 기반
         for canon, pat in self.engine_patterns:
@@ -631,3 +655,14 @@ class CandidateExtractor:
             key = (c.type, c.span, c.normalized or c.text)
             uniq[key] = c
         return list(uniq.values())
+
+
+test = [
+    """ 법인은 은행이고 AWS, 의왕으로 구성되어있습니다 
+"""
+]
+ce = CandidateExtractor()
+for t in test:
+    print("\n===", t)
+    for c in sorted(ce.extract(t), key=lambda x: x.span):
+        print(c.type, c.text, c.normalized, c.span)

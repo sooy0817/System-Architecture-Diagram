@@ -1,5 +1,7 @@
+# app/schemas/ui_payloads.py
+from __future__ import annotations
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
 
 
 class CreateSessionRequest(BaseModel):
@@ -11,6 +13,26 @@ class CreateSessionResponse(BaseModel):
     state: Dict[str, Any]
 
 
+class ChatMessage(BaseModel):
+    role: str  # "user" | "assistant" | "system"
+    content: str
+    timestamp: Optional[str] = None
+
+
+class ChatRequest(BaseModel):
+    message: str
+
+
+class ChatResponse(BaseModel):
+    run_id: str
+    messages: List[ChatMessage]
+    current_step: str
+    next_step: Optional[str] = None
+    state: Dict[str, Any]
+    ui_data: Optional[Dict[str, Any]] = None  # 추가 UI 표시용 데이터
+
+
+# 기존 스키마들은 내부 처리용으로 유지
 class CorpCenterStepRequest(BaseModel):
     corporation: str
     centers: List[str]
@@ -24,16 +46,9 @@ class StepResponse(BaseModel):
 
 
 class NetworksStepRequest(BaseModel):
-    # 센터별 zone 입력(자유 텍스트)
-    center_zones: Dict[str, str]  # {"의왕":"내부망, DMZ망", "안성":"내부망, DMZ망"}
-    # 센터별 장비 입력(자유 텍스트)
-    center_devices: Optional[Dict[str, str]] = (
-        None  # {"의왕":"외부GSLB, SK회선,...", "안성":""}
-    )
-
-    # 센터 외 네트워크(선택)
+    center_zones: Dict[str, str]
+    center_devices: Optional[Dict[str, str]] = None
     external_networks: Optional[List[dict]] = None
-    # 예: [{"name":"중계기관", "zones":"대외망"}]  zones도 자유텍스트로 받아도 됨
 
 
 class NextScopeResponse(BaseModel):
@@ -53,6 +68,17 @@ class ScopeDetailResponse(BaseModel):
     run_id: str
     current_scope: dict | None
     remaining: int
+    next_step: str
+    message: str
+    state: Dict[str, Any]
+
+
+class EdgesRequest(BaseModel):
+    edge_text: str
+
+
+class EdgesResponse(BaseModel):
+    run_id: str
     next_step: str
     message: str
     state: Dict[str, Any]

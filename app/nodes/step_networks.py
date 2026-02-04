@@ -46,15 +46,8 @@ def _extract_device_tokens(text: str) -> List[Dict[str, Any]]:
     return items
 
 
-def step_networks(state: GraphState, payload: Dict[str, Any]) -> GraphState:
-    """
-    payload 예:
-      {
-        "center_zones": {"의왕":"내부망, DMZ망", "안성":"내부망, DMZ망"},
-        "center_devices": {"의왕":"외부GSLB, SK회선, ..."},
-        "external_networks": [{"name":"중계기관", "zones":"대외망"}]
-      }
-    """
+def step_networks(state: GraphState) -> GraphState:
+    payload = state.get("networks_payload") or {}
     centers = state.get("centers", [])
     center_zones: Dict[str, str] = payload.get("center_zones") or {}
     center_devices: Dict[str, str] = payload.get("center_devices") or {}
