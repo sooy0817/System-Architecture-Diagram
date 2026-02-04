@@ -154,6 +154,99 @@ def make_example(
 
 
 # -----------------------------
+# SPANIFY (학습 포맷 맞춤: text + spans)
+# -----------------------------
+def _find_span(text: str, needle: str):
+    i = text.find(needle)
+    if i < 0:
+        return None
+    return (i, i + len(needle))
+
+
+def spanify_example(ex: Dict[str, Any]) -> Dict[str, Any] | None:
+    """
+    v4.1 포맷(문자열 entities/relations)을
+    GLiNER2 학습용(span 포함) 포맷으로 변환해서 반환.
+    실패 시 None.
+    """
+    text = ex["input"]
+    ents = ex["output"]["entities"]
+    rels = ex["output"]["relations"]
+
+    # 1) relation에 쓰인 엔티티부터 span 확보 (안정성)
+    mention_map = {}  # (label, text) -> (start, end)
+    used_spans = set()  # 이미 사용된 span 위치 추적
+
+    def find_unused_span(needle: str):
+        """텍스트에서 아직 사용되지 않은 span을 찾음"""
+        start = 0
+        while True:
+            i = text.find(needle, start)
+            if i < 0:
+                return None
+            span = (i, i + len(needle))
+            if span not in used_spans:
+                used_spans.add(span)
+                return span
+            start = i + 1
+
+    for r in rels:
+        for side_key in ("head", "tail"):
+            side = r[side_key]
+            k = (side["label"], side["text"])
+            if k in mention_map:
+                continue
+            sp = find_unused_span(side["text"])
+            if sp is None:
+                return None
+            mention_map[k] = sp
+
+    # 2) entities에 있는 것들도 span 확보
+    for lab, txts in ents.items():
+        for t in txts:
+            k = (lab, t)
+            if k in mention_map:
+                continue
+            sp = find_unused_span(t)
+            if sp is None:
+                return None
+            mention_map[k] = sp
+
+    # 3) entities: span list
+    span_entities = []
+    for (lab, t), (s, e) in mention_map.items():
+        span_entities.append({"label": lab, "text": t, "start": s, "end": e})
+
+    # 4) relations: head/tail에 span 추가
+    span_relations = []
+    for r in rels:
+        h = r["head"]
+        t = r["tail"]
+        hs, he = mention_map[(h["label"], h["text"])]
+        ts, te = mention_map[(t["label"], t["text"])]
+        span_relations.append(
+            {
+                "type": r["type"],
+                "head": {
+                    "label": h["label"],
+                    "text": h["text"],
+                    "start": hs,
+                    "end": he,
+                },
+                "tail": {
+                    "label": t["label"],
+                    "text": t["text"],
+                    "start": ts,
+                    "end": te,
+                },
+            }
+        )
+
+    # 5) 최종 출력 포맷(학습용)
+    return {"text": text, "entities": span_entities, "relations": span_relations}
+
+
+# -----------------------------
 # NORMALIZATION NOISE
 # -----------------------------
 def maybe_noise(s: str, label: str, noise_ratio: float) -> str:
@@ -320,9 +413,7 @@ def gen_connected_ext_iface(noise_ratio: float) -> Dict[str, Any]:
 
 
 def gen_has_covers(noise_ratio: float) -> Dict[str, Any]:
-    diagram = materialize_entity(
-        "Diagram", "구성도", noise_ratio
-    )  # 또는 "구성도1" 같은 고정값
+    diagram = materialize_entity("Diagram", "구성도", noise_ratio)
     corp = materialize_entity("Corporation", choice("Corporation"), noise_ratio)
     text = one_of(
         f"{diagram}는 {corp}을 포함한다.",
@@ -431,7 +522,6 @@ def generate_balanced_sample(
     multi_ratio: float,
 ) -> Dict[str, Any]:
     if random.random() < multi_ratio:
-        # multi 중에서도 희소 relation/label에 도움 되는 걸 선택
         best = None
         best_score = -1e9
         for fn in MULTI_GENERATORS:
@@ -464,15 +554,12 @@ def generate_balanced_sample(
         if b > best_benefit:
             best, best_benefit = ex, b
 
-    # fallback (이론상 거의 안 탐)
     if best is None:
-        # 아무거나 valid 나올 때까지
         for _ in range(50):
             ex = random.choice(random.choice(list(REGISTRY.values())))(noise_ratio)
             ok, _ = validate_example(ex)
             if ok:
                 return ex
-        # 그래도 안되면 그냥 마지막 생성본 반환(디버그 목적)
         return ex
 
     return best
@@ -521,10 +608,18 @@ def main():
             dropped["giveup"] += 1
             continue
 
+        # ✅ 형식만 학습용(span 포함)으로 변환
+        span_ex = spanify_example(ex)
+        if span_ex is None:
+            dropped["spanify_fail"] += 1
+            continue
+
+        # 카운트/밸런싱 로직은 기존 ex로 유지(의도 보존)
         r_add, l_add = extract_counts(ex)
         rel_counter.update(r_add)
         label_counter.update(l_add)
-        samples.append(ex)
+
+        samples.append(span_ex)
 
     random.shuffle(samples)
     split = int(len(samples) * (1 - args.val_ratio))
