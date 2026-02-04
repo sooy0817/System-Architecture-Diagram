@@ -17,6 +17,7 @@ class GraphState(TypedDict, total=False):
     corporation: Optional[Dict[str, Any]]  # {"name": "은행"}
     centers: List[str]  # ["의왕", "안성"]
     current_center_index: Optional[int]  # 현재 처리 중인 센터 인덱스
+    pending_confirmation: Optional[Dict[str, Any]]  # 확인 대기 중인 데이터
 
     # step2: networks
     networks_payload: Optional[Dict[str, Any]]  # API 입력 데이터

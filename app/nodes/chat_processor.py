@@ -455,53 +455,134 @@ def _handle_back(state: GraphState, current_step: str) -> Dict[str, Any]:
 
 
 # =========================================================
-# 5) Step: corp-center
+# 5) Step: corp-center (Fuzzy Matching 적용)
 # =========================================================
 def _step_corp_center(state: GraphState, message: str, extractor) -> Dict[str, Any]:
-    import re
+    from app.extract.fuzzy_matcher import fuzzy_matcher
 
-    corporation_keywords = [
-        "은행",
-        "중앙회",
-        "농협",
-        "신협",
-        "카드",
-        "증권",
-        "보험",
-        "캐피탈",
-        "저축은행",
-    ]
-    corporations: List[str] = [k for k in corporation_keywords if k in message]
-    corporations = _dedupe_keep_order(corporations)
+    # Fuzzy 매칭 실행
+    match_result = fuzzy_matcher.match_entities(message)
 
-    # 센터 추출: 우선순위 키워드 + 패턴 + 대문자
-    priority_centers = ["의왕", "안성", "AWS", "IDC"]
-    centers: List[str] = [c for c in priority_centers if c in message]
+    # 확인 대기 상태 체크
+    pending_confirmation = state.get("pending_confirmation")
 
-    if not centers:
-        patterns = [
-            r"([가-힣A-Za-z0-9]+)센터",
-            r"([가-힣A-Za-z0-9]+)지점",
-            r"([가-힣A-Za-z0-9]+)본점",
-        ]
-        for pat in patterns:
-            for m in re.finditer(pat, message):
-                name = m.group(1)
-                if name and name != "센터" and len(name) >= 2:
-                    centers.append(name)
+    # 사용자가 확인 응답을 한 경우
+    if pending_confirmation:
+        confirm_keywords = ["확인", "네", "yes", "맞아", "맞습니다", "ok", "ㅇㅋ"]
+        reject_keywords = ["아니", "no", "다시", "아니요"]
 
-    english_caps = re.findall(r"\b[A-Z]{2,}\b", message)
-    for c in english_caps:
-        centers.append(c)
+        msg_lower = message.lower().strip()
 
-    centers = _dedupe_keep_order(centers)
+        if any(k in msg_lower for k in confirm_keywords):
+            # 확인 완료 - pending 데이터 사용
+            corporations = pending_confirmation.get("corporations", [])
+            centers = pending_confirmation.get("centers", [])
+
+            # pending 상태 제거
+            state.pop("pending_confirmation", None)
+
+            # 다음 단계로 진행 (아래 성공 로직과 동일)
+            corporation = corporations[0] if corporations else "기본법인"
+            if not centers:
+                centers = ["센터1"]
+
+            state["corporation"] = {"name": corporation}
+            state["centers"] = centers
+            state["current_center_index"] = 0
+            state["center_networks"] = state.get("center_networks", {})
+            state["next_step"] = "networks"
+
+            current_center = centers[0]
+            total_centers = len(centers)
+
+            centers_display = ", ".join([f"`{c}`" for c in centers])
+            confirmation = f"✅ `{corporation}` 구성도를 만들어드리겠습니다!\n\n📋 총 {len(centers)}개 센터: {centers_display}\n\n먼저 `{current_center}`부터 시작하겠습니다."
+
+            ui = _ui_payload(
+                title=f"{corporation} 구성도",
+                subtitle="센터별 네트워크 영역을 수집합니다",
+                step="networks",
+                progress=(1, total_centers),
+                summary={
+                    "corporation": corporation,
+                    "centers": centers,
+                    "center_networks": state.get("center_networks", {}),
+                },
+                target={"center": current_center},
+                extracted={
+                    "confirmed": True,
+                    "corporations": corporations,
+                    "centers": centers,
+                },
+                examples=["내부망, DMZ망, 외부망", "내부망만", "지점망, 사용자망"],
+                actions=["back", "summary"],
+                helper="지금은 '네트워크 영역'만 입력받습니다. 장비는 다음 단계에서 확장 가능합니다.",
+            )
+
+            response = _bubble(
+                question=f"{confirmation}\n\n어떤 네트워크 영역들이 있나요?",
+                examples=["내부망, DMZ망, 외부망", "내부망만"],
+                hint="키워드 기반으로 인식합니다. (내부망/DMZ망/외부망/지점망/사용자망)",
+            )
+
+            return {"response": response, "next_step": "networks", "ui_data": ui}
+
+        elif any(k in msg_lower for k in reject_keywords):
+            # 거부 - pending 제거하고 다시 입력 요청
+            state.pop("pending_confirmation", None)
+
+            ui = _ui_payload(
+                title="법인/센터 입력",
+                subtitle="다시 입력해주세요",
+                step="corp-center",
+                progress=(1, 1),
+                summary={},
+                target={},
+                extracted={"rejected": True},
+                examples=[
+                    "은행 의왕센터와 AWS 구성도 만들어줘",
+                    "중앙회 안성센터 구성도",
+                ],
+                actions=["summary"],
+                helper="법인(은행/중앙회 등)과 센터(의왕/AWS/안성 등)를 포함해 주세요.",
+            )
+
+            response = _bubble(
+                question="알겠습니다. 법인과 센터를 다시 입력해주세요.",
+                examples=[
+                    "은행 의왕센터와 AWS 구성도 만들어줘",
+                    "중앙회 안성센터 구성도",
+                ],
+                hint="예시처럼 '법인 + 센터'가 같이 들어가면 인식이 안정적입니다.",
+            )
+
+            return {"response": response, "next_step": "corp-center", "ui_data": ui}
+
+    # 매칭 결과 추출
+    corporations = fuzzy_matcher.get_best_matches(
+        match_result.corporations, min_confidence=fuzzy_matcher.CONFIDENCE_ASK
+    )
+    centers = fuzzy_matcher.get_best_matches(
+        match_result.centers, min_confidence=fuzzy_matcher.CONFIDENCE_ASK
+    )
+
     centers = _sort_centers_preferred(centers)
 
     extracted = {
         "message": message,
         "corporations_found": corporations,
         "centers_found": centers,
-        "english_caps_found": english_caps,
+        "match_details": {
+            "corporations": [
+                {"matched": m.matched, "confidence": m.confidence, "type": m.match_type}
+                for m in match_result.corporations
+            ],
+            "centers": [
+                {"matched": m.matched, "confidence": m.confidence, "type": m.match_type}
+                for m in match_result.centers
+            ],
+        },
+        "needs_confirmation": match_result.needs_confirmation,
     }
 
     # 실패: 아무것도 못 찾음
@@ -528,9 +609,101 @@ def _step_corp_center(state: GraphState, message: str, extractor) -> Dict[str, A
         )
         return {"response": response, "next_step": "corp-center", "ui_data": ui}
 
-    corporation = corporations[0] if corporations else "기본법인"
+    # 케이스: 두 개 이상 애매함 → 전체 재입력 요청
+    if match_result.confirmation_message == "multiple_uncertain":
+        ui = _ui_payload(
+            title="법인/센터 입력",
+            subtitle="입력 내용이 불명확합니다",
+            step="corp-center",
+            progress=(1, 1),
+            summary={},
+            target={},
+            extracted=extracted,
+            examples=["은행 의왕센터와 AWS 구성도 만들어줘", "중앙회 안성센터 구성도"],
+            actions=["summary"],
+            helper="법인과 센터를 명확하게 입력해 주세요.",
+        )
+        response = _bubble(
+            question="입력하신 내용을 정확히 인식하지 못했어요.\n법인과 센터를 다시 명확하게 입력해주세요.",
+            examples=["은행 의왕센터와 AWS 구성도", "중앙회 안성센터 구성도"],
+            hint="오타가 있거나 알 수 없는 단어가 포함되어 있을 수 있습니다.",
+        )
+        return {"response": response, "next_step": "corp-center", "ui_data": ui}
+
+    # 확인 필요: Confidence가 애매한 경우 (하나만)
+    if match_result.needs_confirmation:
+        # pending 상태 저장
+        state["pending_confirmation"] = {
+            "corporations": corporations,
+            "centers": centers,
+            "message": message,
+        }
+
+        ui = _ui_payload(
+            title="법인/센터 확인",
+            subtitle="입력 내용을 확인해주세요",
+            step="corp-center",
+            progress=(1, 1),
+            summary={},
+            target={},
+            extracted=extracted,
+            examples=["확인", "네", "아니요", "다시"],
+            actions=["summary"],
+            helper="'확인' 또는 '네'를 입력하면 진행됩니다.",
+        )
+
+        response = _bubble(
+            question=match_result.confirmation_message,
+            examples=["확인", "네", "아니요"],
+            hint="정확하지 않으면 다시 입력해 주세요.",
+            show_back_hint=False,
+        )
+
+        return {"response": response, "next_step": "corp-center", "ui_data": ui}
+
+    # 법인이 없으면 재입력 요청 (기본법인 사용 안 함)
+    if not corporations:
+        ui = _ui_payload(
+            title="법인/센터 입력",
+            subtitle="법인 정보가 필요합니다",
+            step="corp-center",
+            progress=(1, 1),
+            summary={},
+            target={},
+            extracted=extracted,
+            examples=["은행 의왕센터와 AWS 구성도", "중앙회 안성센터 구성도"],
+            actions=["summary"],
+            helper="법인(은행/중앙회 등)을 반드시 포함해 주세요.",
+        )
+        response = _bubble(
+            question="법인 정보를 찾지 못했어요. 법인명을 포함해서 다시 입력해주세요.",
+            examples=["은행 의왕센터와 AWS 구성도", "중앙회 안성센터 구성도"],
+            hint="법인: 은행, 중앙회, 농협, 신협, 카드, 증권, 보험 등",
+        )
+        return {"response": response, "next_step": "corp-center", "ui_data": ui}
+
+    # 센터가 없으면 재입력 요청
     if not centers:
-        centers = ["센터1"]
+        ui = _ui_payload(
+            title="법인/센터 입력",
+            subtitle="센터 정보가 필요합니다",
+            step="corp-center",
+            progress=(1, 1),
+            summary={},
+            target={},
+            extracted=extracted,
+            examples=["은행 의왕센터와 AWS 구성도", "중앙회 안성센터 구성도"],
+            actions=["summary"],
+            helper="센터(의왕/AWS/안성 등)를 반드시 포함해 주세요.",
+        )
+        response = _bubble(
+            question="센터 정보를 찾지 못했어요. 센터명을 포함해서 다시 입력해주세요.",
+            examples=["은행 의왕센터와 AWS 구성도", "중앙회 안성센터 구성도"],
+            hint="센터: 의왕, 안성, AWS, IDC 등",
+        )
+        return {"response": response, "next_step": "corp-center", "ui_data": ui}
+
+    corporation = corporations[0]
 
     # 상태 업데이트
     state["corporation"] = {"name": corporation}

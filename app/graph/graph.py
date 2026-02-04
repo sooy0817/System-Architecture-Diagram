@@ -3,19 +3,17 @@ from __future__ import annotations
 
 from langgraph.graph import StateGraph, END
 
-# from langgraph.checkpoint.memory import MemorySaver  # ← 기존
-from langgraph.checkpoint.redis import RedisSaver  # ← Redis 사용
+from langgraph.checkpoint.memory import MemorySaver  # ← 메모리 사용 (개발용)
+# from langgraph.checkpoint.redis import RedisSaver  # ← Redis 사용 (프로덕션용)
 
 from app.graph.state import GraphState
 from app.nodes.chat_handler import chat_handler
 
-# Redis 체크포인터 (영구 저장)
-checkpointer = RedisSaver(
-    redis_url="redis://localhost:6379/0"  # Redis 연결 정보
-)
+# MemorySaver 체크포인터 (개발용 - 메모리에만 저장)
+checkpointer = MemorySaver()
 
-# 또는 MemorySaver (개발용)
-# checkpointer = MemorySaver() # 인스턴스 생성
+# 프로덕션에서는 Redis 사용:
+# checkpointer = RedisSaver(redis_url="redis://localhost:6379/0")
 
 
 def build_graph():
