@@ -1,0 +1,24 @@
+# GLiNER2 Training Requirements
+
+# Core
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.20.0
+
+# Data processing
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# Model serialization
+safetensors>=0.3.0
+huggingface_hub>=0.16.0
+
+# Korean tokenizer
+mecab-python3>=1.0.0
+python-mecab-ko>=1.0.0
+
+# GLiNER dependency
+gliner>=0.1.0
+
+# Optional: Weights & Biases for logging
+# wandb>=0.15.0
