@@ -58,7 +58,7 @@ def send_message(run_id: str, req: ChatRequest):
         state["messages"] = messages
 
         # 그래프 실행 - invoke 사용
-        print(f"Invoking graph...")
+        print("Invoking graph...")
         result = graph.invoke(state, config=config)
         print(f"Graph result type: {type(result)}")
 
@@ -74,6 +74,16 @@ def send_message(run_id: str, req: ChatRequest):
         print(f"Next step: {final_state.get('next_step')}")
         print(f"Current center index: {final_state.get('current_center_index')}")
 
+        # 그래프 실행 후 메시지 히스토리 복원 (그래프가 덮어쓸 수 있음)
+        final_messages = final_state.get("messages", [])
+
+        # 사용자 메시지가 없으면 추가
+        if not any(
+            msg.get("role") == "user" and msg.get("content") == req.message
+            for msg in final_messages
+        ):
+            final_messages.append(user_message.model_dump())
+
         # 어시스턴트 응답 추가
         assistant_response = final_state.get("last_response", "")
         if assistant_response:
@@ -82,14 +92,19 @@ def send_message(run_id: str, req: ChatRequest):
                 content=assistant_response,
                 timestamp=datetime.now().isoformat(),
             )
-            messages.append(assistant_message.model_dump())
-            final_state["messages"] = messages
+            final_messages.append(assistant_message.model_dump())
+
+        # 최종 메시지 히스토리 저장
+        final_state["messages"] = final_messages
 
         # ui_data 구성
         ui_data = final_state.get("last_ui_data", {})
         ui_data["corporation"] = (final_state.get("corporation") or {}).get("name")
         ui_data["centers"] = final_state.get("centers", [])
         ui_data["center_networks"] = final_state.get("center_networks", {})
+        ui_data["scope_details"] = final_state.get(
+            "scope_details", {}
+        )  # 스코프 상세 정보 추가
 
         current_center_index = final_state.get("current_center_index", 0)
         centers = final_state.get("centers", [])
@@ -102,11 +117,11 @@ def send_message(run_id: str, req: ChatRequest):
         ui_data["total_centers"] = len(centers)
 
         print(f"UI data: {ui_data}")
-        print(f"=== End of message processing ===\n")
+        print("=== End of message processing ===\n")
 
         return ChatResponse(
             run_id=run_id,
-            messages=[ChatMessage(**msg) for msg in messages],
+            messages=[ChatMessage(**msg) for msg in final_messages],
             current_step=final_state.get("next_step", "corp-center"),
             next_step=final_state.get("next_step"),
             state=final_state,

@@ -91,7 +91,7 @@ VOCAB = {
     ],
     "SystemGroup": ["인증 시스템", "결제 시스템", "계정계 시스템", "카드 시스템"],
     "DBMS": ["ORACLE", "TIBERO", "MS_SQL", "POSTGRES"],
-    "Interface": ["EAI", "NGW", "IGW", "MFT", "FOS", "영업점MCA", "API_GW"],
+    "Interface": ["EAI", "NGW", "IGW", "MFT", "FOS", "MCA", "API_GW"],
     "ExternalSystem": ["휴대폰본인확인 nice", "금융결제원", "KISA", "NICE평가정보"],
     "NetworkDevice": ["ISW 라우터", "IRT 라우터", "FW01 방화벽", "L4 스위치"],
     "GSLB": ["내부 GSLB", "외부 GSLB"],

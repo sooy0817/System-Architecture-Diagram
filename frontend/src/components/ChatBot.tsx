@@ -50,6 +50,20 @@ const StepIndicator: React.FC<StepIndicatorProps> = ({ step, title, completed, c
   );
 };
 
+// 전체 진행률 계산 함수
+const getOverallProgress = (step: string): number => {
+  const stepProgress: Record<string, number> = {
+    'corp-center': 10,
+    'scope-detail': 30,
+    'networks': 50,
+    'edges': 70,
+    'next-scope': 85,
+    'review': 95,
+    'export': 100
+  };
+  return stepProgress[step] || 0;
+};
+
 const ChatBot: React.FC<ChatBotProps> = ({ runId, onSessionCreate, initialMessages = [] }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputMessage, setInputMessage] = useState('');
@@ -279,7 +293,7 @@ const ChatBot: React.FC<ChatBotProps> = ({ runId, onSessionCreate, initialMessag
           )}
 
           {/* 전체 진행률 (하단에 고정) */}
-          {uiData?.current_index !== undefined && uiData?.total_centers && (
+          {currentStep && (
             <div className="mt-4 pt-3 border-t border-gray-200">
               <div className="flex items-center space-x-2 mb-1">
                 <Clock className="w-3 h-3 text-gray-600" />
@@ -288,11 +302,11 @@ const ChatBot: React.FC<ChatBotProps> = ({ runId, onSessionCreate, initialMessag
               <div className="w-full bg-gray-200 rounded-full h-1.5">
                 <div 
                   className="bg-gradient-to-r from-blue-500 to-indigo-600 h-1.5 rounded-full transition-all duration-500" 
-                  style={{ width: `${((uiData.current_index + 1) / uiData.total_centers) * 100}%` }}
+                  style={{ width: `${getOverallProgress(currentStep)}%` }}
                 />
               </div>
               <div className="text-xs text-gray-500 text-center mt-1">
-                {Math.round(((uiData.current_index + 1) / uiData.total_centers) * 100)}%
+                {getOverallProgress(currentStep)}%
               </div>
             </div>
           )}
