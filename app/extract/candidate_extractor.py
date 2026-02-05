@@ -2,7 +2,17 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
-from app.graph.vocab import VOCAB, ALIAS
+import json
+from pathlib import Path
+
+VOCAB_PATH = Path(__file__).resolve().parents[1] / "common" / "vocab.json"
+# app/extract/... 이면 parents[1] == app
+
+with VOCAB_PATH.open("r", encoding="utf-8") as f:
+    data = json.load(f)
+
+VOCAB = data["VOCAB"]
+ALIAS = data["ALIAS"]
 
 
 @dataclass
