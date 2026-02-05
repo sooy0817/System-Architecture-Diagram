@@ -2,6 +2,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
+from app.graph.vocab import VOCAB, ALIAS
 
 
 @dataclass
@@ -20,8 +21,8 @@ class CandidateExtractor:
 
         self.re_name = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]{3,}\b")
 
-        self.corporation_allow = ["은행", "중앙회"]
-        self.center_allow = ["의왕", "안성", "AWS"]
+        self.corporation_allow = VOCAB["Corporation"]
+        self.center_allow = VOCAB["Center"]
         self.corporation_patterns = self._build_ko_ascii_token_patterns(
             self.corporation_allow, allow_suffix=None, case_insensitive=True
         )
@@ -114,9 +115,16 @@ class CandidateExtractor:
             re.IGNORECASE,
         )
 
-        self.engine_patterns = self._build_alias_patterns(self.engine_map)
-        self.zone_patterns = self._build_alias_patterns(self.zone_map)
-        self.interface_patterns = self._build_alias_patterns(self.interface_map)
+        # --- ALIAS 기반 패턴(추가) ---
+        self.alias_patterns = self._build_label_alias_patterns(ALIAS)
+
+        # label별로 기존 patterns에 merge (원하면 기존 map은 제거 가능)
+        self.center_patterns.extend(self.alias_patterns.get("Center", []))
+        self.zone_patterns.extend(self.alias_patterns.get("NetworkZone", []))
+        self.interface_patterns.extend(self.alias_patterns.get("Interface", []))
+
+        # DBMS는 지금 engine_patterns로 쓰고 있으니 여기로 합치거나 이름을 바꿔도 됨
+        self.engine_patterns.extend(self.alias_patterns.get("DBMS", []))
 
         self.interface_patterns = [
             (c, p) for (c, p) in self.interface_patterns if c != "IGW"
@@ -247,6 +255,47 @@ class CandidateExtractor:
 
                 patterns.append((canon, re.compile(rx, re.IGNORECASE)))
         return patterns
+
+    def _build_label_alias_patterns(
+        self, alias_by_label: dict[str, dict[str, dict[str, list[str]]]]
+    ) -> dict[str, list[tuple[str, re.Pattern]]]:
+        """
+        ALIAS = {
+        "Center": {"의왕센터": ["의왕", "의왕 센터", ...], ...},
+        "Interface": {"IGW": ["I-GW", ...], ...},
+        ...
+        }
+        를 받아 label별 (canon, pattern) 리스트로 컴파일해서 반환
+        """
+        out: dict[str, list[tuple[str, re.Pattern]]] = {}
+
+        for label, canon_map in alias_by_label.items():
+            patterns: list[tuple[str, re.Pattern]] = []
+            seen = set()
+
+            for canon, variants in canon_map.items():
+                keys = {self._norm_key(canon)}
+                for v in variants:
+                    keys.add(self._norm_key(v))
+
+                for k in sorted(keys, key=len, reverse=True):
+                    if not k:
+                        continue
+                    # 너무 짧은 건 오탐 위험: 3 이상만
+                    # (단, PG/RT 같은 건 너가 이미 예외 처리하는 방식 유지 가능)
+                    if len(k) < 3:
+                        continue
+
+                    rx = self._flex_regex_from_key(k)
+                    sig = (canon, rx)
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    patterns.append((canon, re.compile(rx, re.IGNORECASE)))
+
+            out[label] = patterns
+
+        return out
 
     def _prune_overlaps_longest(
         self,
