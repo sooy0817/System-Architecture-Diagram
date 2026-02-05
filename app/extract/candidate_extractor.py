@@ -19,6 +19,13 @@ class CandidateExtractor:
         self.context_chars = context_chars
         self.context_max = context_max
 
+        self.dbms_canon_map = {
+            "POSTGRES": "postgres",
+            "ORACLE": "oracle",
+            "MS_SQL": "mssql",
+            "TIBERO": "tibero",
+        }
+
         self.re_name = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]{3,}\b")
 
         self.corporation_allow = VOCAB["Corporation"]
@@ -114,6 +121,10 @@ class CandidateExtractor:
             r"(gslb|firewall|fw|router|rt|switch|sw|방화벽|라우터|스위치|회선|line|라인)",
             re.IGNORECASE,
         )
+
+        self.engine_patterns = self._build_alias_patterns(self.engine_map)
+        self.zone_patterns = self._build_alias_patterns(self.zone_map)
+        self.interface_patterns = self._build_alias_patterns(self.interface_map)
 
         # --- ALIAS 기반 패턴(추가) ---
         self.alias_patterns = self._build_label_alias_patterns(ALIAS)
@@ -257,7 +268,7 @@ class CandidateExtractor:
         return patterns
 
     def _build_label_alias_patterns(
-        self, alias_by_label: dict[str, dict[str, dict[str, list[str]]]]
+        self, alias_by_label: dict[str, dict[str, list[str]]]
     ) -> dict[str, list[tuple[str, re.Pattern]]]:
         """
         ALIAS = {
@@ -372,314 +383,32 @@ class CandidateExtractor:
         right = min(len(text), e + window)
         return bool(self.re_line_context.search(text[left:right]))
 
-    def _context(self, text: str, s: int, e: int) -> str:
+    def _context(self, full_text: str, s: int, e: int) -> str:
         left = max(0, s - self.context_chars)
-        right = min(len(text), e + self.context_chars)
-        ctx = text[left:right]
+        right = min(len(full_text), e + self.context_chars)
+        ctx = full_text[left:right]
         return ctx[: self.context_max]  # 상한
 
-    def extract(
-        self, text: str, *, depth: int = 0, max_depth: int = 1
+    def extract_by_lines(
+        self, full_text: str, *, max_depth: int = 1
     ) -> List[Candidate]:
         out: List[Candidate] = []
 
-        # A) NameCandidate
-        for m in self.re_name.finditer(text):
-            s, e = m.span()
-            token = m.group(0)
-            out.append(
-                Candidate(
-                    token,
-                    type="NameCandidate",
-                    span=(s, e),
-                    context=self._context(text, s, e),
+        offset = 0
+        for line in full_text.splitlines(True):  # True: 줄바꿈(\n) 포함 → offset 정확
+            chunk = line
+            out.extend(
+                self.extract(
+                    chunk, full_text=full_text, max_depth=max_depth, base_offset=offset
                 )
             )
+            offset += len(chunk)
 
-        for canon, pat in self.corporation_patterns:
-            for m in pat.finditer(text):
-                s, e = m.span()
-                out.append(
-                    Candidate(
-                        text=text[s:e],
-                        type="CorporationHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized=canon,
-                    )
-                )
+        # 라인별 결과를 합친 뒤, 기존 post-process 로직(중복제거/overlap prune)을 한 번만 적용
+        out = self._post_process(full_text, out)
+        return out
 
-        lowered = text.lower()
-
-        # A-2) CenterHint
-        for canon, pat in self.center_patterns:
-            for m in pat.finditer(text):
-                s, e = m.span()
-                out.append(
-                    Candidate(
-                        text=text[s:e],
-                        type="CenterHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized=canon,
-                    )
-                )
-
-        # B) EngineHint - 정규화/유연매칭 기반
-        for canon, pat in self.engine_patterns:
-            for m in pat.finditer(text):
-                s, e = m.span()
-                out.append(
-                    Candidate(
-                        text=text[s:e],
-                        type="EngineHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized=canon,
-                    )
-                )
-
-        # B-2) DBMSRoleHint - 모두 찾기
-        for norm, variants in self.dbms_role_map.items():
-            for v in variants:
-                vv = v.lower()
-                for m in re.finditer(re.escape(vv), lowered):
-                    s, e = m.span()
-                    out.append(
-                        Candidate(
-                            text=text[s:e],
-                            type="DBMSRoleHint",
-                            span=(s, e),
-                            context=self._context(text, s, e),
-                            normalized=norm,
-                        )
-                    )
-
-        # C) ZoneHint - 정규화/유연매칭 기반
-        for canon, pat in self.zone_patterns:
-            for m in pat.finditer(text):
-                s, e = m.span()
-                out.append(
-                    Candidate(
-                        text=text[s:e],
-                        type="ZoneHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized=canon,
-                    )
-                )
-
-        # C-2) InterfaceHint - 정규화/유연매칭 기반
-        for canon, pat in self.interface_patterns:
-            for m in pat.finditer(text):
-                s, e = m.span()
-                out.append(
-                    Candidate(
-                        text=text[s:e],
-                        type="InterfaceHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized=canon,
-                    )
-                )
-
-        # --- Quoted block ---
-        re_quoted = re.compile(r'"([^"\n]{1,120})"')
-
-        for m in re_quoted.finditer(text):
-            qs, qe = m.span()
-            inner = m.group(1).strip()
-            if len(inner) < 2:
-                continue
-
-            # 대표 이름 (통째)
-            out.append(
-                Candidate(
-                    text=inner,
-                    type="QuotedNameCandidate",
-                    span=(qs + 1, qe - 1),
-                    context=self._context(text, qs, qe),
-                    normalized=None,
-                )
-            )
-
-            if depth < max_depth:
-                inner_candidates = self.extract(
-                    inner,
-                    depth=depth + 1,
-                    max_depth=max_depth,
-                )
-            else:
-                inner_candidates = []
-
-            base = qs + 1
-            for c in inner_candidates:
-                # QuotedNameCandidate 재귀 금지
-                if c.type == "QuotedNameCandidate":
-                    continue
-
-                out.append(
-                    Candidate(
-                        text=c.text,
-                        type=c.type,
-                        span=(base + c.span[0], base + c.span[1]),
-                        context=self._context(text, base + c.span[0], base + c.span[1]),
-                        normalized=c.normalized,
-                    )
-                )
-
-        # C-3) DeviceTypeHint - 모두 찾기
-        for norm, variants in self.device_type_map.items():
-            for v in variants:
-                vv = v.lower()
-
-                if norm in {"Router", "Switch"} and vv in {"rt", "sw"}:
-                    continue
-
-                for m in re.finditer(re.escape(vv), lowered):
-                    s, e = m.span()
-                    out.append(
-                        Candidate(
-                            text=text[s:e],
-                            type="DeviceTypeHint",
-                            span=(s, e),
-                            context=self._context(text, s, e),
-                            normalized=norm,
-                        )
-                    )
-
-        for norm, toks in self.device_type_short_tokens.items():
-            for tok in toks:
-                for m in re.finditer(rf"\b{re.escape(tok)}\b", lowered):
-                    s, e = m.span()
-                    out.append(
-                        Candidate(
-                            text=text[s:e],
-                            type="DeviceTypeHint",
-                            span=(s, e),
-                            context=self._context(text, s, e),
-                            normalized=norm,
-                        )
-                    )
-
-        # C-3-b) ISP + Line 표현: "sk회선", "sk 라인", "sk line", "sk-회선" 등 변형 커버
-        # - ISP 토큰 단독은 Line으로 만들지 않고, Line류 단서가 근처/결합된 경우만 허용
-        for tok in self.isp_short_tokens:
-            # 1) 붙어있는 결합형: sk회선 / sk라인 / skline / sk전용회선 ...
-            for m in re.finditer(
-                rf"{re.escape(tok)}\s*(회선|전용회선|대외회선|망연계|line|라인)",
-                lowered,
-            ):
-                s, e = m.span()
-                out.append(
-                    Candidate(
-                        text=text[s:e],
-                        type="DeviceTypeHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized="Line",
-                    )
-                )
-
-            # 2) 분리형: "sk line", "sk 라인" 등 (sk 자체가 standalone이면서 line 컨텍스트 근처인 경우)
-            for m in re.finditer(rf"\b{re.escape(tok)}\b", lowered):
-                s, e = m.span()
-                if not self._has_line_context_near(text, s, e, window=30):
-                    continue
-                out.append(
-                    Candidate(
-                        text=text[s:e],
-                        type="DeviceTypeHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized="Line",
-                    )
-                )
-
-        # C-4) DeviceSubtypeHint - 모두 찾기
-        for norm, variants in self.device_subtype_map.items():
-            for v in variants:
-                vv = v.lower()
-                for m in re.finditer(re.escape(vv), lowered):
-                    s, e = m.span()
-
-                    # internal/external은 "장비 단서"가 근처에 있을 때만 허용
-                    if not self._is_standalone_token(text, s, e):
-                        continue
-
-                    if norm in {"internal", "external"}:
-                        if not self._has_device_anchor_near(text, s, e, window=25):
-                            continue
-
-                    out.append(
-                        Candidate(
-                            text=text[s:e],
-                            type="DeviceSubtypeHint",
-                            span=(s, e),
-                            context=self._context(text, s, e),
-                            normalized=norm,
-                        )
-                    )
-
-        # D) enum hints
-        for word in self.server_class:
-            for m in re.finditer(rf"\b{re.escape(word)}\b", text):
-                s, e = m.span()
-                out.append(
-                    Candidate(
-                        word,
-                        type="ServerClassHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized=word,
-                    )
-                )
-
-        for word in self.server_type:
-            for m in re.finditer(re.escape(word), text):
-                s, e = m.span()
-                out.append(
-                    Candidate(
-                        word,
-                        type="ServerTypeHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized=word,
-                    )
-                )
-
-        for word in self.state:
-            for m in re.finditer(rf"\b{re.escape(word)}\b", text):
-                s, e = m.span()
-                out.append(
-                    Candidate(
-                        word,
-                        type="StateHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized=word.capitalize(),
-                    )
-                )
-
-        for word in self.workload:
-            if re.fullmatch(r"[A-Z]{2,4}", word):
-                pattern = rf"\b{re.escape(word)}\b"
-            else:
-                pattern = re.escape(word)
-
-            for m in re.finditer(pattern, text):
-                s, e = m.span()
-                out.append(
-                    Candidate(
-                        text=text[s:e],
-                        type="WorkloadHint",
-                        span=(s, e),
-                        context=self._context(text, s, e),
-                        normalized=word,
-                    )
-                )
-
-        # (권장) dedupe
+    def _post_process(self, full_text: str, out: List[Candidate]) -> List[Candidate]:
         api_spans = {
             c.span
             for c in out
@@ -704,6 +433,184 @@ class CandidateExtractor:
             key = (c.type, c.span, c.normalized or c.text)
             uniq[key] = c
         return list(uniq.values())
+
+    def extract(
+        self,
+        text: str,
+        *,
+        full_text: Optional[str] = None,
+        out: Optional[List[Candidate]] = None,
+        depth: int = 0,
+        max_depth: int = 1,
+        base_offset: int = 0,
+    ) -> List[Candidate]:
+        """
+        - text: 현재 청크(라인) 문자열
+        - full_text: 전체 원문(라인 분할 전)
+        - base_offset: text가 full_text에서 시작하는 오프셋
+        핵심: Candidate.span / context / text slice는 항상 full_text 기준(gs,ge)로 만든다.
+        """
+        if full_text is None:
+            full_text = text
+        if out is None:
+            out = []
+
+        def emit(
+            type_: str,
+            s: int,
+            e: int,
+            normalized: Optional[str] = None,
+            *,
+            text_override: Optional[str] = None,
+        ):
+            gs, ge = base_offset + s, base_offset + e
+            out.append(
+                Candidate(
+                    text=text_override
+                    if text_override is not None
+                    else full_text[gs:ge],
+                    type=type_,
+                    span=(gs, ge),
+                    context=self._context(full_text, gs, ge),
+                    normalized=normalized,
+                )
+            )
+
+        lowered = text.lower()
+
+        # A) NameCandidate (token 유지)
+        for m in self.re_name.finditer(text):
+            s, e = m.span()
+            emit("NameCandidate", s, e, text_override=m.group(0))
+
+        # A-1) CorporationHint
+        for canon, pat in self.corporation_patterns:
+            for m in pat.finditer(text):
+                s, e = m.span()
+                emit("CorporationHint", s, e, normalized=canon)
+
+        # A-2) CenterHint
+        for canon, pat in self.center_patterns:
+            for m in pat.finditer(text):
+                s, e = m.span()
+                emit("CenterHint", s, e, normalized=canon)
+
+        # B) EngineHint (DBMS)
+        for canon, pat in self.engine_patterns:
+            for m in pat.finditer(text):
+                s, e = m.span()
+                norm = self.dbms_canon_map.get(canon, canon)
+                emit("EngineHint", s, e, normalized=norm)
+
+        # B-2) DBMSRoleHint
+        for norm, variants in self.dbms_role_map.items():
+            for v in variants:
+                vv = v.lower()
+                for m in re.finditer(re.escape(vv), lowered):
+                    s, e = m.span()
+                    emit("DBMSRoleHint", s, e, normalized=norm)
+
+        # C) ZoneHint
+        for canon, pat in self.zone_patterns:
+            for m in pat.finditer(text):
+                s, e = m.span()
+                emit("ZoneHint", s, e, normalized=canon)
+
+        # C-2) InterfaceHint
+        for canon, pat in self.interface_patterns:
+            for m in pat.finditer(text):
+                s, e = m.span()
+                emit("InterfaceHint", s, e, normalized=canon)
+
+        # --- Quoted block: 안정화 버전(재귀 없이 quoted 자체만) ---
+        re_quoted = re.compile(r'"([^"\n]{1,120})"')
+        for m in re_quoted.finditer(text):
+            qs, qe = m.span()
+            # 따옴표 내부만 span으로 잡음
+            emit("QuotedNameCandidate", qs + 1, qe - 1, normalized=None)
+
+        # C-3) DeviceTypeHint (long tokens)
+        for norm, variants in self.device_type_map.items():
+            for v in variants:
+                vv = v.lower()
+
+                # short token은 아래에서 별도 처리
+                if norm in {"Router", "Switch"} and vv in {"rt", "sw"}:
+                    continue
+
+                for m in re.finditer(re.escape(vv), lowered):
+                    s, e = m.span()
+                    emit("DeviceTypeHint", s, e, normalized=norm)
+
+        # C-3-a) DeviceTypeHint (short tokens: rt/sw)
+        for norm, toks in self.device_type_short_tokens.items():
+            for tok in toks:
+                for m in re.finditer(rf"\b{re.escape(tok)}\b", lowered):
+                    s, e = m.span()
+                    emit("DeviceTypeHint", s, e, normalized=norm)
+
+        # C-3-b) ISP + Line 표현: sk회선 / sk line 등
+        for tok in self.isp_short_tokens:
+            # 결합형
+            for m in re.finditer(
+                rf"{re.escape(tok)}\s*(회선|전용회선|대외회선|망연계|line|라인)",
+                lowered,
+            ):
+                s, e = m.span()
+                emit("DeviceTypeHint", s, e, normalized="Line")
+
+            # 분리형 (토큰 standalone + line context 근처)
+            for m in re.finditer(rf"\b{re.escape(tok)}\b", lowered):
+                s, e = m.span()
+                if not self._has_line_context_near(text, s, e, window=30):
+                    continue
+                emit("DeviceTypeHint", s, e, normalized="Line")
+
+        # C-4) DeviceSubtypeHint
+        for norm, variants in self.device_subtype_map.items():
+            for v in variants:
+                vv = v.lower()
+                for m in re.finditer(re.escape(vv), lowered):
+                    s, e = m.span()
+
+                    # 단독 토큰만 허용
+                    if not self._is_standalone_token(text, s, e):
+                        continue
+
+                    # internal/external은 장비 앵커 근처일 때만
+                    if norm in {"internal", "external"}:
+                        if not self._has_device_anchor_near(text, s, e, window=25):
+                            continue
+
+                    emit("DeviceSubtypeHint", s, e, normalized=norm)
+
+        # D) Enum hints
+        for word in self.server_class:
+            for m in re.finditer(rf"\b{re.escape(word)}\b", text):
+                s, e = m.span()
+                emit("ServerClassHint", s, e, normalized=word)
+
+        for word in self.server_type:
+            for m in re.finditer(re.escape(word), text):
+                s, e = m.span()
+                emit("ServerTypeHint", s, e, normalized=word)
+
+        for word in self.state:
+            for m in re.finditer(rf"\b{re.escape(word)}\b", text):
+                s, e = m.span()
+                emit("StateHint", s, e, normalized=word.capitalize())
+
+        for word in self.workload:
+            pattern = (
+                rf"\b{re.escape(word)}\b"
+                if re.fullmatch(r"[A-Z]{2,4}", word)
+                else re.escape(word)
+            )
+            for m in re.finditer(pattern, text):
+                s, e = m.span()
+                emit("WorkloadHint", s, e, normalized=word)
+
+        return out
 
 
 test = [
@@ -761,5 +668,5 @@ BT WAS 서버그룹이 1대(PaaS) 존재합니다.
 ce = CandidateExtractor()
 for t in test:
     print("\n===", t)
-    for c in sorted(ce.extract(t), key=lambda x: x.span):
+    for c in sorted(ce.extract_by_lines(t), key=lambda x: x.span):
         print(c.type, c.text, c.normalized, c.span)
